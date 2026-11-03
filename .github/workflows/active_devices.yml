@@ -1,39 +1,77 @@
-name: Build UEFI for active devices
+# Build UEFI for OnePlus Ace 3 (PJE110 / aston, model 0)
+#
+# 用法：把本文件放到 fork 仓库的 .github/workflows/build-aston.yml，
+#       然后在 GitHub 网页上 Actions → Build UEFI for PJE110 → Run workflow。
+#       全程浏览器操作，Windows 上不需要装 Git / Python / LLVM / VS Build Tools。
+#
+# 为什么需要自定义 workflow：上游 .github/workflows/active_devices.yml 只构建
+# Status.md 里标为 "**State:** Active" 的设备，而 aston 标的是 Inactive，
+# 所以官方 CI 不会产出 Mu-aston-0.img。这里直接指定 -d aston -m 0。
+
+name: Build UEFI for PJE110 (aston)
+
 on:
+  workflow_dispatch:
   push:
     branches: ["main"]
     paths:
-      - 'Binaries'
-      - 'Common/**'
-      - 'Mu_Basecore'
-      - 'MuPatches/**'
-      - 'Platforms/**'
-      - 'Silicon/**'
-      - 'Silicium-ACPI'
-  workflow_dispatch:
-  pull_request:
-    types: [opened, reopened]
-    paths:
-      - 'Binaries'
-      - 'Common/**'
-      - 'Mu_Basecore'
-      - 'MuPatches/**'
-      - 'Platforms/**'
-      - 'Silicon/**'
-      - 'Silicium-ACPI'
-env:
-  CI_BUILD: true
+      - ".github/workflows/build-aston.yml"
+
 jobs:
   build:
     runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v7
-      - name: Build UEFI for active devices
-        run: bash ./setup_env.sh -p apt && bash ./build_active_devices.sh -r DEBUG
 
-      - name: Upload UEFI images
+    steps:
+      - name: Checkout with submodules
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      # 不设 CI_BUILD=true：setup_env.sh 在 CI_BUILD=true 时会
+      # `apt full-upgrade -y`，在 runner 上没有必要且会拖慢构建。
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          bash ./setup_env.sh -p apt
+
+      # build_uefi.py 用了 tomllib，需要 Python >= 3.11。
+      # 用 venv 避开 Ubuntu 24.04 的 PEP 668 externally-managed-environment。
+      # 主脚本用 sys.executable 调起 DeviceBuild.py，venv 内是一致的解释器。
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: |
+          python -m venv .venv
+          . .venv/bin/activate
+          python -m pip install --upgrade pip
+          python -m pip install -r pip-requirements.txt
+
+      # -m 0 = DEVICE_MODEL 0 = "Ace 3" / PJE110 / 23801
+      # -r DEBUG = 出调试日志，第一次启动要靠它拿 UART 输出
+      - name: Build aston / model 0 / DEBUG
+        run: |
+          . .venv/bin/activate
+          python build_uefi.py -d aston -m 0 -r DEBUG
+
+      - name: Upload boot image
         uses: actions/upload-artifact@v7
         with:
-          name: uefi-images
-          path: ./Mu-*
+          name: Mu-aston-0-DEBUG
+          path: ./Mu-aston-0.img
+          if-no-files-found: error
           compression-level: 9
+
+      # 同时把构建日志留档，失败时可以直接贴出来排查
+      - name: Upload build directory on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: aston-build-logs
+          path: |
+            Build/**/*.txt
+            Build/**/*.log
+          if-no-files-found: ignore
