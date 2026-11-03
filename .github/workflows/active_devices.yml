@@ -7,11 +7,24 @@
 # 为什么需要自定义 workflow：上游 .github/workflows/active_devices.yml 只构建
 # Status.md 里标为 "**State:** Active" 的设备，而 aston 标的是 Inactive，
 # 所以官方 CI 不会产出 Mu-aston-0.img。这里直接指定 -d aston -m 0。
+#
+# 版本演进：
+#   v1 = 上游原样（已实机跑通，UEFI 到 BDS，"Failed to Find an Operating System!"）
+#   v2 = 让 DEBUG 日志同步到 LogFs，替代拍照（本文件默认）
+#   v3 = 勾 with_high_dram=yes，把 bank 6+7 加进 UEFI memmap
 
 name: Build UEFI for PJE110 (aston)
 
 on:
   workflow_dispatch:
+    inputs:
+      with_high_dram:
+        description: "把实测的 DDR bank 6+7 加进 UEFI memmap（第三阶段再勾）"
+        type: choice
+        default: "no"
+        options:
+          - "no"
+          - "yes"
   push:
     branches: ["main"]
     paths:
@@ -29,7 +42,7 @@ jobs:
           fetch-depth: 0
 
       # 不设 CI_BUILD=true：setup_env.sh 在 CI_BUILD=true 时会
-      # `apt full-upgrade -y`，在 runner 上没有必要且会拖慢构建。
+      # apt full-upgrade -y，在 runner 上没有必要且会拖慢构建。
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -37,7 +50,6 @@ jobs:
 
       # build_uefi.py 用了 tomllib，需要 Python >= 3.11。
       # 用 venv 避开 Ubuntu 24.04 的 PEP 668 externally-managed-environment。
-      # 主脚本用 sys.executable 调起 DeviceBuild.py，venv 内是一致的解释器。
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -50,6 +62,40 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r pip-requirements.txt
 
+      # 上游默认是 {"EnableLogFsSyncInRetail", 0x0}：日志只在内存里，
+      # 重启回原厂后 logfs/logdump 分区读不到 UEFI 阶段的内容。
+      # 改成 0x1 让 DEBUG 日志落盘，就不用举着手机拍照了。
+      # grep 单独跑一遍：若上游改了写法导致 sed 没匹配，这步会失败并暴露。
+      - name: Enable UEFI debug log sync to LogFs
+        run: |
+          CFG=Platforms/OnePlus/astonPkg/Library/ConfigurationMapLib/ConfigurationMapLib.c
+          sed -i 's/{"EnableLogFsSyncInRetail", 0x0}/{"EnableLogFsSyncInRetail", 0x1}/' "$CFG"
+          grep -n 'EnableLogFsSyncInRetail' "$CFG"
+
+      # 上游 gMemoryDescriptor[] 没有任何 >= 4 GiB 的条目，UEFI 不知道
+      # 高位 DRAM 存在，XNU 也就拿不到 0x8C0000000 / 12 GiB。
+      # 这两条地址来自本机 /proc/device-tree/memory/reg 实测。
+      # 默认不勾：先看 v2 的 memmap/日志，再决定要不要让 UEFI 看见它们。
+      - name: Add high DRAM banks (optional)
+        if: ${{ inputs.with_high_dram == 'yes' }}
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("Platforms/OnePlus/astonPkg/Library/MemoryMapLib/MemoryMapLib.c")
+          s = p.read_text()
+          anchor = '  {"LLCC LPI",          0xFF800000, 0x00600000, AddMem, MEM_RES, UNCACHEABLE, Reserv, UNCACHED_UNBUFFERED_XN},\n'
+          assert anchor in s, "anchor not found - upstream MemoryMapLib.c layout changed"
+          add = (
+              '\n'
+              '  // PJE110 measured: /proc/device-tree/memory/reg banks 6+7\n'
+              '  {"DDR Bank 6",        0x8C0000000, 0x140000000, AddMem, SYS_MEM, SYS_MEM_CAP, Conv, WRITE_BACK_XN},\n'
+              '  {"DDR Bank 7",        0xA00000000, 0x200000000, AddMem, SYS_MEM, SYS_MEM_CAP, Conv, WRITE_BACK_XN},\n'
+          )
+          p.write_text(s.replace(anchor, anchor + add, 1))
+          print("inserted high DRAM banks")
+          PY
+          grep -n 'DDR Bank' Platforms/OnePlus/astonPkg/Library/MemoryMapLib/MemoryMapLib.c
+
       # -m 0 = DEVICE_MODEL 0 = "Ace 3" / PJE110 / 23801
       # -r DEBUG = 出调试日志，第一次启动要靠它拿 UART 输出
       - name: Build aston / model 0 / DEBUG
@@ -60,7 +106,7 @@ jobs:
       - name: Upload boot image
         uses: actions/upload-artifact@v7
         with:
-          name: Mu-aston-0-DEBUG
+          name: ${{ inputs.with_high_dram == 'yes' && 'Mu-aston-0-DEBUG-highdram' || 'Mu-aston-0-DEBUG' }}
           path: ./Mu-aston-0.img
           if-no-files-found: error
           compression-level: 9
